@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: <PodName>
+  labels:
+    app.kubernetes.io/name: myapp
+    app.kubernetes.io/component: <Environment>
+    app.kubernetes.io/instance: <InstanceName>
+spec:
+  containers:
+    - name: base-pod
+      image: <Image>
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "500m"
+        limits:
+          memory: "128Mi"
+          cpu: "500m"
+      ports:
+        - containerPort: <Port>
