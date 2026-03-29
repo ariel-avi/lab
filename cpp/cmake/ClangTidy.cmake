@@ -45,39 +45,51 @@ function(add_clang_tidy_for TARGET_NAME)
 
     # Collect include directories from the target and its dependencies (recursively)
     set(_include_dirs)
+    set(_targets_to_process ${TARGET_NAME})
     set(_visited_targets)
 
-    function(_collect_includes_recursive target_name)
-        # Avoid infinite recursion
-        if (target_name IN_LIST _visited_targets)
-            return()
-        endif()
-        list(APPEND _visited_targets ${target_name})
-        set(_visited_targets ${_visited_targets} PARENT_SCOPE)
+    while(_targets_to_process)
+        list(POP_FRONT _targets_to_process _current_target)
 
-        if (NOT TARGET ${target_name})
-            return()
+        # Skip if already visited
+        if (_current_target IN_LIST _visited_targets)
+            continue()
         endif()
+
+        # Try to resolve alias-style names (e.g., namespace::target -> namespace_target)
+        if (NOT TARGET ${_current_target})
+            string(REPLACE "::" "_" _alt_target "${_current_target}")
+            if (TARGET ${_alt_target})
+                set(_current_target ${_alt_target})
+            else()
+                continue()
+            endif()
+        endif()
+
+        # Resolve alias targets to their actual targets
+        get_target_property(_aliased_target ${_current_target} ALIASED_TARGET)
+        if (_aliased_target)
+            set(_current_target ${_aliased_target})
+            # Check again if we've already visited the aliased target
+            if (_current_target IN_LIST _visited_targets)
+                continue()
+            endif()
+        endif()
+
+        list(APPEND _visited_targets ${_current_target})
 
         # Get include directories from this target
-        get_target_property(_inc_dirs ${target_name} INTERFACE_INCLUDE_DIRECTORIES)
+        get_target_property(_inc_dirs ${_current_target} INTERFACE_INCLUDE_DIRECTORIES)
         if (_inc_dirs AND NOT _inc_dirs STREQUAL "_inc_dirs-NOTFOUND")
             list(APPEND _include_dirs ${_inc_dirs})
-            set(_include_dirs ${_include_dirs} PARENT_SCOPE)
         endif()
 
-        # Recursively process linked libraries
-        get_target_property(_link_libs ${target_name} INTERFACE_LINK_LIBRARIES)
+        # Add linked libraries to the process queue
+        get_target_property(_link_libs ${_current_target} INTERFACE_LINK_LIBRARIES)
         if (_link_libs AND NOT _link_libs STREQUAL "_link_libs-NOTFOUND")
-            foreach(_lib IN LISTS _link_libs)
-                _collect_includes_recursive(${_lib})
-                set(_visited_targets ${_visited_targets} PARENT_SCOPE)
-                set(_include_dirs ${_include_dirs} PARENT_SCOPE)
-            endforeach()
+            list(APPEND _targets_to_process ${_link_libs})
         endif()
-    endfunction()
-
-    _collect_includes_recursive(${TARGET_NAME})
+    endwhile()
 
     # Build extra args for include directories
     set(_extra_include_args)
