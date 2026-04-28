@@ -101,3 +101,92 @@ The Epic and the stories are read-only throughout.
 
 - Descriptions sent to Jira are wrapped in minimal ADF (paragraphs split on blank lines). Markdown formatting from Claude is preserved as text but not rendered as Jira markup.
 - The `parent` field is used for both Epic→Story discovery and Story→Sub-task creation — this requires a modern Jira Cloud instance (post next-gen migration). Older "Epic Link" custom-field setups are not supported.
+
+---
+
+# `jira_create_stories.py` — Usage Guide
+
+Stand-alone script. Reads a `.zip` archive of Markdown files and creates one Jira **Task** per file. No AI involved — each file maps directly to a ticket.
+
+## 1. Prerequisites
+
+- Python 3.10+
+- A Jira Cloud account with permission to create Issues in the target project
+
+## 2. Install dependencies
+
+```bash
+pip install mistune
+```
+
+`mistune` converts Markdown to Atlassian Document Format (ADF) so Jira renders headings, lists, code blocks, and emphasis natively.
+
+## 3. Prepare the zip archive
+
+Create a `.zip` containing one `.md` file per story you want to create:
+
+- **Summary** — taken from the first `# H1` heading in the file (falls back to the filename stem if none is found)
+- **Description** — the rest of the file, converted to ADF
+
+```
+stories.zip
+├── 01-setup-ci-pipeline.md
+├── 02-add-unit-tests.md
+└── 03-write-docs.md
+```
+
+Files are processed in alphabetical order.
+
+## 4. Dry run (recommended first)
+
+Prints the parsed summary and ADF payload for every file without touching Jira:
+
+```bash
+python jira_create_stories.py stories.zip \
+  --jira-email you@example.com \
+  --jira-domain your-org.atlassian.net \
+  --jira-token "$JIRA_TOKEN" \
+  --jira-project PROJ \
+  --dry-run
+```
+
+## 5. Real run
+
+Drop `--dry-run` to actually create the tasks:
+
+```bash
+python jira_create_stories.py stories.zip \
+  --jira-email you@example.com \
+  --jira-domain your-org.atlassian.net \
+  --jira-token "$JIRA_TOKEN" \
+  --jira-project PROJ
+```
+
+Each created ticket is printed as `created <KEY>: <summary>  (from <filename>)`.
+
+## 6. Inputs reference
+
+| Argument / Flag   | Required | Description                                                      |
+|-------------------|----------|------------------------------------------------------------------|
+| `zip_path`        | yes      | Path to the `.zip` file containing `.md` stories                 |
+| `--jira-email`    | yes      | Email tied to the API token                                      |
+| `--jira-domain`   | yes      | Atlassian site host, e.g. `your-org.atlassian.net`               |
+| `--jira-token`    | yes      | Jira Cloud API token                                             |
+| `--jira-project`  | yes      | Jira project key where Tasks will be created (e.g. `PROJ`)       |
+| `--dry-run`       | no       | Print payloads without writing to Jira                           |
+
+## 7. What the script does, step by step
+
+1. Opens the zip and collects all `.md` files (sorted alphabetically)
+2. For each file:
+   1. Extracts the first `# H1` as the **summary**; drops that line from the body
+   2. Converts the remaining Markdown body to ADF
+   3. POSTs a new `Task` to `/rest/api/3/issue`
+3. Prints a summary line: `created: N    failed: N`
+
+## 8. Troubleshooting
+
+- **`401 Unauthorized`** — Check the email/token combo; tokens are bound to the user that created them.
+- **`403 Forbidden`** — Your account lacks "Create Issues" permission on the project.
+- **No `.md` files found** — Ensure the zip contains `.md` files at the root or in subdirectories (not only directories).
+- **Wrong issue type** — The script creates `Task` issues. If your project uses a different name, edit `"name": "Task"` in `create_task` to match.
