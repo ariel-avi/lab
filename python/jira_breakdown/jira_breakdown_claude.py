@@ -24,8 +24,8 @@ from requests.auth import HTTPBasicAuth
 
 # ---------- Config ---------------------------------------------------------
 
-CLAUDE_MODEL = "claude-opus-4-5"
-CLAUDE_MAX_TOKENS = 8000
+CLAUDE_MODEL = "claude-opus-4-5"          # change if desired
+CLAUDE_MAX_TOKENS = 32000                 # Opus 4.x supports up to 32k output
 HTTP_TIMEOUT = 30
 
 
@@ -35,8 +35,7 @@ class JiraClient:
     def __init__(self, domain: str, email: str, api_token: str):
         self.base = f"https://{domain.rstrip('/').removeprefix('https://')}"
         self.auth = HTTPBasicAuth(email, api_token)
-        self.headers = {"Accept": "application/json",
-                        "Content-Type": "application/json"}
+        self.headers = {"Accept": "application/json", "Content-Type": "application/json"}
 
     # ---- read ----
     def get_issue(self, key: str) -> dict[str, Any]:
@@ -48,22 +47,37 @@ class JiraClient:
         return r.json()
 
     def get_epic_stories(self, epic_key: str) -> list[dict[str, Any]]:
-        """Return all child issues of `epic_key` (stories, tasks, bugs - excluding sub-tasks)."""
+        """Return all child issues of `epic_key` (stories, tasks, bugs - excluding sub-tasks).
+
+        Uses `/rest/api/3/search/jql` (the legacy `/search` endpoint was removed in
+        2025 and now returns 410 Gone). Pagination is token-based via `nextPageToken`.
+        """
         jql = f'parent = "{epic_key}" AND issuetype != Sub-task'
-        issues, start, page = [], 0, 50
+        issues: list[dict[str, Any]] = []
+        next_token: str | None = None
         while True:
+            params: dict[str, Any] = {
+                "jql": jql,
+                "maxResults": 100,
+                # New endpoint defaults to id only; request the fields we need explicitly.
+                "fields": "summary,description,issuetype,project",
+            }
+            if next_token:
+                params["nextPageToken"] = next_token
             r = requests.get(
-                f"{self.base}/rest/api/3/search",
+                f"{self.base}/rest/api/3/search/jql",
                 auth=self.auth, headers=self.headers, timeout=HTTP_TIMEOUT,
-                params={"jql": jql, "startAt": start, "maxResults": page,
-                        "fields": "summary,description,issuetype,project"},
+                params=params,
             )
             r.raise_for_status()
             data = r.json()
             issues.extend(data.get("issues", []))
-            if start + page >= data.get("total", 0):
+            if data.get("isLast") or not data.get("nextPageToken"):
                 break
-            start += page
+            new_token = data["nextPageToken"]
+            if new_token == next_token:  # safety against the known infinite-loop bug
+                break
+            next_token = new_token
         return issues
 
     # ---- write ----
@@ -91,7 +105,7 @@ class JiraClient:
 # ---------- ADF helpers ----------------------------------------------------
 
 def _adf_to_text(node: Any) -> str:
-    """Flatten Atlassian Document Format to plain text (best-effort)."""
+    """Flatten Atlassian Document Format to plain text (best-effort, for READING)."""
     if node is None:
         return ""
     if isinstance(node, str):
@@ -113,14 +127,192 @@ def _adf_to_text(node: Any) -> str:
     return children
 
 
+# Lazy mistune parser; built once on first use.
+_md_parser = None
+
+
+def _get_md_parser():
+    global _md_parser
+    if _md_parser is None:
+        import mistune  # imported lazily so the script runs even without it for read-only ops
+        _md_parser = mistune.create_markdown(
+            renderer=None,
+            plugins=["table", "strikethrough"],
+        )
+    return _md_parser
+
+
+def _adf_inline(children: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Convert mistune inline tokens to ADF inline content nodes."""
+    out: list[dict[str, Any]] = []
+    if not children:
+        return out
+    for tok in children:
+        t = tok.get("type")
+        if t == "text":
+            text = tok.get("raw", "")
+            if text:
+                out.append({"type": "text", "text": text})
+        elif t == "softbreak":
+            # Treat soft line breaks as a single space — Jira paragraphs don't preserve them.
+            out.append({"type": "text", "text": " "})
+        elif t == "linebreak":
+            out.append({"type": "hardBreak"})
+        elif t == "codespan":
+            out.append({"type": "text", "text": tok.get("raw", ""),
+                        "marks": [{"type": "code"}]})
+        elif t == "strong":
+            for n in _adf_inline(tok.get("children")):
+                marks = n.setdefault("marks", [])
+                marks.append({"type": "strong"})
+                out.append(n)
+        elif t == "emphasis":
+            for n in _adf_inline(tok.get("children")):
+                marks = n.setdefault("marks", [])
+                marks.append({"type": "em"})
+                out.append(n)
+        elif t == "strikethrough":
+            for n in _adf_inline(tok.get("children")):
+                marks = n.setdefault("marks", [])
+                marks.append({"type": "strike"})
+                out.append(n)
+        elif t == "link":
+            url = tok.get("attrs", {}).get("url", "")
+            for n in _adf_inline(tok.get("children")):
+                marks = n.setdefault("marks", [])
+                marks.append({"type": "link", "attrs": {"href": url}})
+                out.append(n)
+        else:
+            # Fallback: flatten unknown inline node to its text content.
+            for n in _adf_inline(tok.get("children")):
+                out.append(n)
+    return out
+
+
+def _adf_inline_plain(children: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Same as _adf_inline but strips marks not allowed in headings/table headers if needed."""
+    return _adf_inline(children)
+
+
+def _adf_list_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert mistune list_item tokens to ADF listItem nodes."""
+    adf_items: list[dict[str, Any]] = []
+    for item in items:
+        item_content: list[dict[str, Any]] = []
+        for child in item.get("children", []):
+            ctype = child.get("type")
+            if ctype == "block_text":
+                # Tight list — wrap inline children in a paragraph.
+                item_content.append({
+                    "type": "paragraph",
+                    "content": _adf_inline(child.get("children")),
+                })
+            else:
+                item_content.extend(_adf_block(child))
+        if not item_content:
+            item_content = [{"type": "paragraph", "content": []}]
+        adf_items.append({"type": "listItem", "content": item_content})
+    return adf_items
+
+
+def _adf_table(token: dict[str, Any]) -> dict[str, Any]:
+    """Convert mistune table token to ADF table."""
+    rows: list[dict[str, Any]] = []
+    for child in token.get("children", []):
+        ctype = child.get("type")
+        if ctype == "table_head":
+            cells = [
+                {"type": "tableHeader",
+                 "content": [{"type": "paragraph",
+                              "content": _adf_inline(c.get("children"))}]}
+                for c in child.get("children", [])
+            ]
+            rows.append({"type": "tableRow", "content": cells})
+        elif ctype == "table_body":
+            for row in child.get("children", []):
+                cells = [
+                    {"type": "tableCell",
+                     "content": [{"type": "paragraph",
+                                  "content": _adf_inline(c.get("children"))}]}
+                    for c in row.get("children", [])
+                ]
+                rows.append({"type": "tableRow", "content": cells})
+    return {"type": "table", "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+            "content": rows}
+
+
+def _adf_block(token: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert a single mistune block token to one or more ADF block nodes."""
+    t = token.get("type")
+    if t == "heading":
+        level = max(1, min(6, token.get("attrs", {}).get("level", 1)))
+        return [{"type": "heading", "attrs": {"level": level},
+                 "content": _adf_inline(token.get("children"))}]
+    if t == "paragraph":
+        return [{"type": "paragraph", "content": _adf_inline(token.get("children"))}]
+    if t == "block_code":
+        code = token.get("raw", "")
+        attrs = {}
+        info = token.get("attrs", {}).get("info") or token.get("info")
+        if info:
+            attrs["language"] = info.strip().split()[0]
+        node: dict[str, Any] = {"type": "codeBlock",
+                                "content": [{"type": "text", "text": code}] if code else []}
+        if attrs:
+            node["attrs"] = attrs
+        return [node]
+    if t == "block_quote":
+        inner: list[dict[str, Any]] = []
+        for child in token.get("children", []):
+            inner.extend(_adf_block(child))
+        return [{"type": "blockquote", "content": inner or [{"type": "paragraph", "content": []}]}]
+    if t == "list":
+        ordered = bool(token.get("attrs", {}).get("ordered"))
+        list_type = "orderedList" if ordered else "bulletList"
+        return [{"type": list_type, "content": _adf_list_items(token.get("children", []))}]
+    if t == "thematic_break":
+        return [{"type": "rule"}]
+    if t == "table":
+        return [_adf_table(token)]
+    if t == "blank_line":
+        return []
+    # Unknown block — render as a paragraph with its raw text if present.
+    raw = token.get("raw", "").strip()
+    if raw:
+        return [{"type": "paragraph", "content": [{"type": "text", "text": raw}]}]
+    return []
+
+
 def _to_adf(text: str) -> dict[str, Any]:
-    """Wrap plain/markdown text into a minimal ADF doc (paragraphs split on blank lines)."""
-    blocks = [b.strip() for b in re.split(r"\n\s*\n", text.strip()) if b.strip()]
-    content = [
-                  {"type": "paragraph",
-                   "content": [{"type": "text", "text": block}]}
-                  for block in blocks
-              ] or [{"type": "paragraph", "content": []}]
+    """Convert markdown text to a Jira ADF document.
+
+    Falls back to a plain-paragraph doc if markdown parsing produces nothing usable.
+    """
+    if not text or not text.strip():
+        return {"type": "doc", "version": 1,
+                "content": [{"type": "paragraph", "content": []}]}
+    try:
+        parser = _get_md_parser()
+        tokens = parser(text)
+    except Exception:
+        tokens = None
+
+    content: list[dict[str, Any]] = []
+    if isinstance(tokens, list):
+        for tok in tokens:
+            content.extend(_adf_block(tok))
+
+    if not content:
+        # Fallback: split on blank lines as plain paragraphs.
+        for block in re.split(r"\n\s*\n", text.strip()):
+            block = block.strip()
+            if block:
+                content.append({"type": "paragraph",
+                                "content": [{"type": "text", "text": block}]})
+
+    if not content:
+        content = [{"type": "paragraph", "content": []}]
+
     return {"type": "doc", "version": 1, "content": content}
 
 
@@ -174,32 +366,57 @@ Emit the subtasks as a JSON array now.
 
 def break_down_story(claude: Anthropic, instructions: str,
                      epic_text: str, story_text: str) -> list[dict[str, str]]:
-    msg = claude.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=CLAUDE_MAX_TOKENS,
-        system=SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": USER_TEMPLATE.format(
-                instructions=instructions, epic=epic_text, story=story_text),
-        }],
-    )
-    raw = "".join(
-        b.text for b in msg.content if getattr(b, "type", None) == "text").strip()
+    # Streaming is required when max_tokens is large enough that the request
+    # could exceed the 10-minute non-streaming limit.
+    with claude.messages.stream(
+            model=CLAUDE_MODEL,
+            max_tokens=CLAUDE_MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": USER_TEMPLATE.format(
+                    instructions=instructions, epic=epic_text, story=story_text),
+            }],
+    ) as stream:
+        # Drain the stream; the SDK accumulates the final message internally.
+        for _ in stream.text_stream:
+            pass
+        msg = stream.get_final_message()
+
+    # Detect truncation explicitly — otherwise the user sees an opaque JSON parse error.
+    if msg.stop_reason == "max_tokens":
+        usage = getattr(msg, "usage", None)
+        out_tokens = getattr(usage, "output_tokens", "?") if usage else "?"
+        raise RuntimeError(
+            f"Claude response was truncated (stop_reason=max_tokens, "
+            f"output_tokens={out_tokens}, limit={CLAUDE_MAX_TOKENS}). "
+            "Increase CLAUDE_MAX_TOKENS or tighten the breakdown instructions."
+        )
+
+    raw = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text").strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+
+    # Be tolerant of stray prose around the array: slice from first `[` to last `]`.
+    if not raw.startswith("["):
+        first, last = raw.find("["), raw.rfind("]")
+        if first != -1 and last > first:
+            raw = raw[first:last + 1]
+
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"Claude did not return valid JSON: {e}\n---\n{raw}") from e
+        snippet = raw if len(raw) < 2000 else raw[:1000] + "\n...[truncated]...\n" + raw[-1000:]
+        raise RuntimeError(
+            f"Claude did not return valid JSON: {e}\n"
+            f"stop_reason={msg.stop_reason}\n---\n{snippet}"
+        ) from e
     if not isinstance(data, list):
         raise RuntimeError(f"Expected a JSON array, got: {type(data).__name__}")
     out = []
     for i, item in enumerate(data):
-        if not isinstance(item,
-                          dict) or "summary" not in item or "description" not in item:
+        if not isinstance(item, dict) or "summary" not in item or "description" not in item:
             raise RuntimeError(f"Subtask {i} missing required fields: {item}")
-        out.append(
-            {"summary": str(item["summary"]), "description": str(item["description"])})
+        out.append({"summary": str(item["summary"]), "description": str(item["description"])})
     return out
 
 
@@ -266,8 +483,7 @@ def main() -> int:
                 )
                 print(f"  + {new_key}: {st['summary']}")
             except Exception as e:
-                print(f"  ! Failed to create subtask '{st['summary']}': {e}",
-                      file=sys.stderr)
+                print(f"  ! Failed to create subtask '{st['summary']}': {e}", file=sys.stderr)
         print()
 
     return 0

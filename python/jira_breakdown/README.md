@@ -10,11 +10,13 @@ Stand-alone script. Reads a Jira Epic + its stories, asks Claude to break each s
 
 ## 2. Install dependencies
 
-The script depends on two PyPI packages only — no project setup needed.
+The script depends on three PyPI packages only — no project setup needed.
 
 ```bash
-pip install requests anthropic
+pip install requests anthropic mistune
 ```
+
+`mistune` is used to convert the markdown subtask bodies returned by Claude into Atlassian Document Format so Jira renders headings, lists, tables, code spans, and emphasis natively.
 
 ## 3. Get a Jira API token
 
