@@ -41,7 +41,10 @@ function(add_clang_tidy_for TARGET_NAME)
     # Per-target clang-tidy
     set(_tidy_target "clang-tidy_${TARGET_NAME}")
 
-    set(_HEADER_FILTER "^(src|include|tests)/")
+    # The header filter is intentionally left to HeaderFilterRegex in .clang-tidy.
+    # compile_commands.json uses absolute paths, so an anchored relative regex
+    # such as "^(src|include|tests)/" never matches and hides all header
+    # diagnostics. Callers can still pass -header-filter via CLANG_TIDY_EXE.
 
     # Collect include directories from the target and its dependencies (recursively)
     set(_include_dirs)
@@ -119,7 +122,6 @@ function(add_clang_tidy_for TARGET_NAME)
     if (APPLE)
         add_custom_target(${_tidy_target}
                 COMMAND ${CLANG_TIDY_EXE}
-                -header-filter=${_HEADER_FILTER}
                 -extra-arg=-nostdinc++
                 -extra-arg=-isysroot
                 -extra-arg=${MACOS_SDK_PATH}
@@ -135,7 +137,6 @@ function(add_clang_tidy_for TARGET_NAME)
     else ()
         add_custom_target(${_tidy_target}
                 COMMAND ${CLANG_TIDY_EXE}
-                -header-filter=${_HEADER_FILTER}
                 ${_extra_include_args}
                 -p "${CMAKE_BINARY_DIR}" ${_tidy_files}
                 COMMENT "Running clang-tidy for target ${TARGET_NAME}"
