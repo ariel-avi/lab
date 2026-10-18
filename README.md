@@ -5,7 +5,7 @@ My personal collection of code snippets, scripts, and patterns that I've found u
 ## 📚 What's Inside
 
 ### C++
-- **CMake Configuration** – Clang-format and clang-tidy integration for consistent code quality
+- **CMake Configuration** – Clang-format, clang-tidy and gcov coverage (gcovr) integration for consistent code quality
 - Quality tooling setup for modern C++ projects
 
 ### Python
