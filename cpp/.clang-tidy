@@ -39,6 +39,7 @@ CheckOptions:
   # Variables
   - { key: readability-identifier-naming.VariableCase, value: lower_case }
   - { key: readability-identifier-naming.LocalVariableCase, value: lower_case }
+  - { key: readability-identifier-naming.LocalConstantCase, value: lower_case }
   - { key: readability-identifier-naming.GlobalVariableCase, value: lower_case }
   - { key: readability-identifier-naming.ParameterCase, value: lower_case }
 
